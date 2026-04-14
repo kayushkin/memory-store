@@ -1,0 +1,216 @@
+# memory-store
+
+Persistent vector memory with semantic search for the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem.
+
+SQLite-backed memory store that gives AI agents cross-session knowledge retention. Memories are embedded as TF-IDF vectors for semantic search, scored by importance and recency, and automatically decayed and compacted over time. A context builder assembles optimal prompt context within a token budget.
+
+```
+  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+       Agent / Application  (inber, openclaw, llm-bridge)
+  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┬ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+                                 │
+              Save / Search / BuildContext / PrepareSession
+                                 │
+  ╔══════════════════════════════╪══════════════════════════════╗
+  ║                    memory-store                            ║
+  ║                              │                             ║
+  ║   ┌──────────────────────────▼─────────────────────────┐   ║
+  ║   │                    MemoryStore                     │   ║
+  ║   │                                                    │   ║
+  ║   │  Save ─── upsert with auto-embedding & tagging    │   ║
+  ║   │  Search ─ semantic search with scoring             │   ║
+  ║   │  BuildContext ─ token-budgeted prompt assembly     │   ║
+  ║   │  PrepareSession ─ load identity, tools, files      │   ║
+  ║   │  Decay / Compact ─ lifecycle management            │   ║
+  ║   │                                                    │   ║
+  ║   └──────────────────────────┬─────────────────────────┘   ║
+  ║                              │                             ║
+  ║   ┌──────────────────────────▼─────────────────────────┐   ║
+  ║   │                SQLite + TF-IDF                     │   ║
+  ║   │          256-dim vectors · cosine similarity       │   ║
+  ║   └────────────────────────────────────────────────────┘   ║
+  ╚════════════════════════════════════════════════════════════╝
+```
+
+## Quick start
+
+### As a library
+
+```go
+import memorystore "github.com/kayushkin/memory-store"
+
+// Open or create a store
+store, _ := memorystore.NewStore("/path/to/memory.db")
+defer store.Close()
+
+// Save a memory
+store.Save(memorystore.Memory{
+    ID:         "setup-preferences",
+    Content:    "User prefers concise responses without emoji",
+    Source:     "user",
+    Importance: 0.8,
+    Tags:       []string{"preference", "style"},
+})
+
+// Semantic search
+results, _ := store.Search("response style", 5)
+
+// Build prompt context within a token budget
+memories, tokens, _ := store.BuildContext(memorystore.BuildContextRequest{
+    Tags:              []string{"preference"},
+    TokenBudget:       32000,
+    IncludeAlwaysLoad: true,
+})
+```
+
+### With HTTP handlers
+
+```go
+mux := http.NewServeMux()
+memorystore.RegisterHandlers(mux, store)
+http.ListenAndServe(":8080", mux)
+```
+
+When used with [llm-bridge-server](https://github.com/kayushkin/llm-bridge-server), memory-store handlers are mounted automatically.
+
+## API
+
+### HTTP endpoints
+
+Registered via `RegisterHandlers(mux, store)`:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/memories` | Save or upsert a memory |
+| `GET` | `/memories/{id}` | Get a memory by ID |
+| `DELETE` | `/memories/{id}` | Forget a memory (soft-delete via importance=0) |
+| `POST` | `/memories/search` | Semantic search with optional orchestrator filter |
+| `GET` | `/memories/recent` | List recent memories (`?limit=20&min_importance=0.5`) |
+| `POST` | `/memories/decay` | Apply importance decay to stale memories |
+| `POST` | `/memories/compact` | Compress old, low-access memories |
+| `POST` | `/memories/context` | Build token-budgeted prompt context |
+
+### Go interface
+
+All operations are available through the `MemoryStore` interface:
+
+```go
+type MemoryStore interface {
+    Save(m Memory) error
+    Get(id string) (*Memory, error)
+    Search(query string, limit int) ([]Memory, error)
+    SearchFiltered(query string, limit int, orchestrator string) ([]Memory, error)
+    Forget(id string) error
+    DecayImportance() error
+    ListRecent(limit int, minImportance float64) ([]Memory, error)
+    Compact(minAge time.Duration, minCount int) ([]CompactionResult, error)
+    BuildContext(req BuildContextRequest) ([]Memory, int, error)
+    PrepareSession(cfg PrepareSessionConfig) error
+    LoadToolRegistry(tools []ToolMetadata) error
+    UpdateToolUsageSummary(toolName, summary string, ttlSeconds int64) error
+    SaveSession(sess Session) error
+    TrackMemoryUsage(memoryID, sessionID string, turnNumber int, usageType string) error
+    Close() error
+}
+```
+
+## How it works
+
+### Memory structure
+
+Each memory has content, a 256-dimensional TF-IDF embedding, an importance score (0-1), tags, and metadata tracking access count and timestamps. Memories can be scoped to a specific orchestrator for multi-agent isolation.
+
+| Field | Description |
+|-------|-------------|
+| `Content` | Main text content |
+| `Importance` | 0-1 relevance score, decays over time |
+| `Source` | Origin: `user`, `agent`, `reflection`, `compaction`, `system` |
+| `Tags` | Categorization tags |
+| `AlwaysLoad` | Permanent context (identity, system instructions) |
+| `ExpiresAt` | Optional TTL for ephemeral memories |
+| `RefType` | Reference type: `memory`, `file`, `identity`, `repo-map`, `tools`, `web` |
+| `RefTarget` | File path or URL for lazy-loaded references |
+| `Orchestrator` | Multi-tenant scoping (`inber`, `openclaw`, etc.) |
+
+### Semantic search
+
+Memories are embedded as 256-dimensional TF-IDF vectors using hash bucketing. Search scores combine three signals:
+
+```
+score = cosineSimilarity × importance × recencyBoost
+```
+
+Recency boost decays exponentially: `0.99^daysSinceAccess`. Accessing a memory boosts its importance by 1% (capped at 1.0).
+
+### Context building
+
+`BuildContext` assembles memories into a prompt context that fits within a token budget. Memories are selected in priority order:
+
+1. **AlwaysLoad** — identity, system instructions
+2. **Tag-matched** — more matching tags = higher priority
+3. **High importance** — above the minimum threshold
+4. **Recently accessed** — recency as tiebreaker
+
+Stable memories (identity, system) are placed before volatile ones for prompt cache stability. Large memories are auto-truncated with expansion hints.
+
+### Importance decay
+
+Memories not accessed in 24 hours have their importance multiplied by 0.99 per decay cycle. This gradually deprioritizes stale knowledge while keeping frequently-accessed memories prominent.
+
+### Compaction
+
+Old memories (configurable age) with low access counts and low importance are grouped by tag and merged into single compacted memories. Originals are soft-deleted (importance set to 0).
+
+### Session preparation
+
+`PrepareSession` bootstraps a session by auto-loading:
+
+1. Agent identity (always-load)
+2. Memory usage instructions (always-load)
+3. Tool registry placeholder (always-load)
+4. Recently modified files (ephemeral, TTL-based)
+
+Recent files are detected via `git log` (preferred) or filesystem mtime scan.
+
+### Session and usage tracking
+
+Sessions record agent name, model, token usage, cost, and summary. Memory usage is tracked per-session with turn numbers, enabling analytics on which memories agents actually use.
+
+## Configuration
+
+```go
+// Store creation
+store, _ := memorystore.NewStore("/path/to/memory.db")
+
+// Or auto-create in .inber/memory.db
+store, _ := memorystore.OpenOrCreate("/project/root")
+```
+
+### BuildContext defaults
+
+| Parameter | Default |
+|-----------|---------|
+| `TokenBudget` | 32,000 |
+| `MinImportance` | 0.4 (when AlwaysLoad excluded) |
+| `TruncatePreview` | 300 chars (~100 tokens) |
+
+### PrepareSession defaults
+
+| Parameter | Default |
+|-----------|---------|
+| `RecencyWindow` | 24 hours |
+| `RecentFilesTTL` | 10 minutes |
+| `AgentName` | `"agent"` |
+
+## Dependencies
+
+```
+modernc.org/sqlite    — Pure Go SQLite
+github.com/google/uuid — UUID generation
+```
+
+No external HTTP framework — uses stdlib `net/http` with Go 1.22+ path patterns.
+
+## Part of the llm-bridge ecosystem
+
+This store is one component of the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem. See the llm-bridge README for the full picture — harness bridges, provider bridges, stores, and example consumers. When used with [llm-bridge-server](https://github.com/kayushkin/llm-bridge-server), memory-store is loaded automatically and its endpoints are mounted on the server.
