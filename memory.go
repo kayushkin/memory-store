@@ -63,8 +63,10 @@ type MemoryStore interface {
 	LoadToolRegistry(tools []ToolMetadata) error
 	UpdateToolUsageSummary(toolName, summary string, ttlSeconds int64) error
 	
-	// Session tracking
-	SaveSession(sess Session) error
+	// Session tracking. SaveSession was retired in Phase II.B —
+	// memory-store no longer maintains its own session metadata; the
+	// session_id passed to TrackMemoryUsage is an opaque reference to
+	// llm-bridge-server's canonical session_id.
 	TrackMemoryUsage(memoryID, sessionID string, turnNumber int, usageType string) error
 	
 	// Lifecycle

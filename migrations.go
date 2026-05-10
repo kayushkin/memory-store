@@ -44,6 +44,14 @@ func runMigrations(db *sql.DB) error {
 		// Orchestrator scoping (2026-03-21)
 		"ALTER TABLE memories ADD COLUMN orchestrator TEXT NOT NULL DEFAULT ''",
 		"CREATE INDEX IF NOT EXISTS idx_orchestrator ON memories(orchestrator)",
+
+		// Phase II.B (2026-05-09): drop the dead sessions / session_tags
+		// tables. memory-store no longer maintains its own session
+		// metadata; per-session aggregates live in log-store's projection.
+		// memory_usage's session_id is now an opaque reference to the
+		// canonical session_id from llm-bridge-server.
+		"DROP TABLE IF EXISTS session_tags",
+		"DROP TABLE IF EXISTS sessions",
 	}
 	
 	for _, migration := range migrations {
