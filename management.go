@@ -69,7 +69,7 @@ func (s *Store) ListByOrchestrator(orchestrator string, limit int, minImportance
 			&m.RefType, &refTarget, &m.IsLazy, &orch,
 		)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("scan memory: %w", err)
 		}
 
 		m.Summary = summary.String
@@ -83,10 +83,16 @@ func (s *Store) ListByOrchestrator(orchestrator string, limit int, minImportance
 			m.ExpiresAt = &exp
 		}
 		if len(embJSON) > 0 {
-			json.Unmarshal(embJSON, &m.Embedding)
+			if err := json.Unmarshal(embJSON, &m.Embedding); err != nil {
+				return nil, fmt.Errorf("unmarshal embedding: %w", err)
+			}
 		}
 
 		result = append(result, m)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rows: %w", err)
 	}
 
 	// Load tags
@@ -164,7 +170,7 @@ func (s *Store) ListRecent(limit int, minImportance float64) ([]Memory, error) {
 			&m.RefType, &refTarget, &m.IsLazy,
 		)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("scan memory: %w", err)
 		}
 
 		m.Summary = summary.String
@@ -178,7 +184,7 @@ func (s *Store) ListRecent(limit int, minImportance float64) ([]Memory, error) {
 		}
 
 		if err := json.Unmarshal(embJSON, &m.Embedding); err != nil {
-			continue
+			return nil, fmt.Errorf("unmarshal embedding: %w", err)
 		}
 
 		result = append(result, m)

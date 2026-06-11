@@ -68,7 +68,7 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 			&m.RefType, &refTarget, &m.IsLazy, &m.Orchestrator,
 		)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("scan memory: %w", err)
 		}
 
 		m.Summary = summary.String
@@ -82,7 +82,7 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 		}
 
 		if err := json.Unmarshal(embJSON, &m.Embedding); err != nil {
-			continue
+			return nil, fmt.Errorf("unmarshal embedding: %w", err)
 		}
 
 		// Calculate similarity
