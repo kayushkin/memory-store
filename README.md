@@ -73,6 +73,34 @@ http.ListenAndServe(":8080", mux)
 
 When used with [llm-bridge-server](https://github.com/kayushkin/llm-bridge-server), memory-store handlers are mounted automatically.
 
+### As a standalone service
+
+For local development, `cmd/memory-store` boots the same HTTP surface on its own
+port:
+
+```sh
+go run ./cmd/memory-store           # listens on :8165 by default
+MEMORY_STORE_ADDR=:9000 MEMORY_STORE_DB=/tmp/mem.db go run ./cmd/memory-store
+```
+
+`MEMORY_STORE_DB` defaults to `$HOME/.config/memory-store/memory.db` (the same
+canonical path llm-bridge-server uses). In production the library is mounted
+into llm-bridge-server rather than run as this binary; the standalone entrypoint
+exists mainly for development and for the clean-checkout smoke below.
+
+### Smoke test
+
+`scripts/e2e-smoke.sh` builds the standalone binary from the current checkout,
+boots it against a throwaway DB on a throwaway port, and drives the real HTTP
+surface (save → read back → search → forget), asserting on parsed bodies. It is
+picked up automatically by the repo-smoke-guard (scheduler job 27), which runs
+it from a clean clone nightly and flags any repo whose committed source no
+longer boots and answers.
+
+```sh
+./scripts/e2e-smoke.sh            # E2E_PORT / E2E_KEEP tunable
+```
+
 ## API
 
 ### HTTP endpoints
