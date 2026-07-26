@@ -25,13 +25,13 @@
 # dumped to stderr on failure.
 #
 # Tunables:
-#   E2E_PORT   — listen port (default 19117)
+#   E2E_PORT   — listen port (default 19128)
 #   E2E_KEEP   — set to "1" to leave $TMP_DIR around after the run
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PORT="${E2E_PORT:-19117}"
+PORT="${E2E_PORT:-19128}"
 BASE="http://127.0.0.1:$PORT"
 
 for bin in go curl jq; do
