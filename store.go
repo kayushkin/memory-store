@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -37,6 +39,64 @@ const busyTimeout = 5000
 // prompt at all.
 const journalMode = "WAL"
 
+// switchJournalMode moves the database file into journalMode, waiting out the
+// other stores converting the same fresh file.
+//
+// Switching a rollback-journal database into WAL takes a brief exclusive lock,
+// and that one statement is the only part of opening a store that busy_timeout
+// cannot mediate. Four connections racing to convert one fresh file, 160 opens
+// per row:
+//
+//	journal_mode alone              120 failed
+//	busy_timeout + journal_mode       1 failed, after 2ms
+//	busy_timeout(30000) + same        2 failed, after 1ms
+//
+// The third row is the finding: six times the timeout changes nothing and the
+// failure still lands in a millisecond, so the wait is never being entered.
+// SQLite declines to run the busy handler when a connection has to upgrade a
+// lock it already holds, because waiting there is how two connections deadlock;
+// it returns SQLITE_BUSY on the spot instead. A longer timeout has nothing to
+// give.
+//
+// So the wait has to be ours. Retrying converges because the race is only ever
+// over the first conversion: once any store has won it the file is in WAL, and
+// every later connection reads the mode back instead of changing it — 240 of
+// 240 concurrent opens against an already-converted file succeeded, against 6
+// retries needed in total to convert 60 fresh ones.
+//
+// Retrying ordinary reads and writes instead of running WAL was tried here
+// before and measured worse than doing nothing — 50s of stalling and still
+// failing. This is not that. It runs once per store, on the one statement that
+// turns WAL on, and everything after it still relies on WAL rather than on
+// waiting.
+func switchJournalMode(db *sql.DB) error {
+	// The conversion gets the same patience as any other contended statement.
+	// busy_timeout is already the answer to "how long is this store willing to
+	// wait for a lock" and there is no reason for a second number.
+	deadline := time.Now().Add(busyTimeout * time.Millisecond)
+
+	var settled string
+	var err error
+	for backoff := time.Millisecond; ; backoff += time.Millisecond {
+		err = db.QueryRow("PRAGMA journal_mode(" + journalMode + ")").Scan(&settled)
+		if err == nil && strings.EqualFold(settled, journalMode) {
+			return nil
+		}
+		if !time.Now().Add(backoff).Before(deadline) {
+			break
+		}
+		time.Sleep(backoff)
+	}
+
+	if err != nil {
+		return fmt.Errorf("switch journal mode to %s: %w", journalMode, err)
+	}
+	// A lost race can also come back quietly, reporting the mode it stayed on
+	// rather than an error, and a store left on the rollback journal is the
+	// serialized queue this whole file exists to avoid.
+	return fmt.Errorf("journal mode settled on %q, want %s", settled, journalMode)
+}
+
 // NewStore creates or opens a memory store at the given path.
 func NewStore(dbPath string) (*Store, error) {
 	dir := filepath.Dir(dbPath)
@@ -46,11 +106,23 @@ func NewStore(dbPath string) (*Store, error) {
 
 	// modernc's driver ignores a DSN key it does not recognise rather than
 	// rejecting it, so `_pragma=` is the only spelling that reaches SQLite and a
-	// typo here would leave both settings at their defaults without saying so.
-	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(%s)", dbPath, busyTimeout, journalMode)
+	// typo here would leave the setting at its default without saying so.
+	//
+	// journal_mode is deliberately not in here with it. The driver replays every
+	// DSN pragma on every connection the pool opens, so putting the conversion
+	// there runs it on connections that cannot retry it and reports the failure
+	// as whatever statement happened to open the connection — which is why this
+	// arrived as "create schema: database is locked". It belongs below, once,
+	// where it can wait.
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(%d)", dbPath, busyTimeout)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+
+	if err := switchJournalMode(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	// Create normalized schema
