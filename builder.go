@@ -2,7 +2,7 @@ package memorystore
 
 import (
 	"database/sql"
-	"encoding/json"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -36,10 +36,17 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 		req.MinImportance = 0.4 // reasonable default if not including always-load
 	}
 
-	// Build query
+	// Build query.
+	//
+	// The embedding column is deliberately absent. BuildContext ranks on
+	// importance, tag overlap and recency — it never calls CosineSimilarity —
+	// so selecting the vector meant reading and JSON-decoding roughly 780 bytes
+	// per row to throw it away, which was the single largest cost in this
+	// function. Search is the path that ranks by embedding, and it still selects
+	// it.
 	now := time.Now()
 	query := `
-	SELECT id, content, summary, original_id, importance, access_count, last_accessed, created_at, source, embedding, always_load, expires_at, tokens, ref_type, ref_target, is_lazy
+	SELECT id, content, summary, original_id, importance, access_count, last_accessed, created_at, source, always_load, expires_at, tokens, ref_type, ref_target, is_lazy
 	FROM memories
 	WHERE importance >= ?
 	  AND (expires_at IS NULL OR expires_at > ?)
@@ -73,7 +80,7 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 	}
 
 	for rows.Next() {
-		m, err := s.scanMemoryRow(rows)
+		m, err := s.scanMemoryRowWithoutEmbedding(rows)
 		if err != nil {
 			continue
 		}
@@ -83,15 +90,26 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 			continue
 		}
 
-		// Load tags for this memory
-		m.Tags, _ = s.loadMemoryTags(m.ID)
+		candidates = append(candidates, memoryWithScore{memory: m})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate memories: %w", err)
+	}
+	rows.Close()
 
-		// Calculate score
-		score := calculateScore(m, tagSet)
-		candidates = append(candidates, memoryWithScore{
-			memory: m,
-			score:  score,
-		})
+	// Tags for the whole candidate set in one pass. Asking per candidate cost a
+	// round trip each, issued while the row cursor above was still open.
+	candidateIDs := make([]string, len(candidates))
+	for i := range candidates {
+		candidateIDs[i] = candidates[i].memory.ID
+	}
+	tagsByMemory, err := s.loadTagsForMemories(candidateIDs)
+	if err != nil {
+		return nil, 0, err
+	}
+	for i := range candidates {
+		candidates[i].memory.Tags = tagsByMemory[candidates[i].memory.ID]
+		candidates[i].score = calculateScore(candidates[i].memory, tagSet)
 	}
 
 	// Sort by priority
@@ -147,17 +165,21 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 	return result, tokensUsed, nil
 }
 
-// scanMemoryRow scans a memory from a database row
-func (s *Store) scanMemoryRow(row *sql.Rows) (Memory, error) {
+// scanMemoryRowWithoutEmbedding scans a memory from a database row whose SELECT
+// omits the embedding column, leaving Memory.Embedding nil.
+//
+// The name says so because the omission is invisible at the call site otherwise:
+// a ranking function that reached for the vector here would compare against an
+// empty one and score every memory identically rather than fail.
+func (s *Store) scanMemoryRowWithoutEmbedding(row *sql.Rows) (Memory, error) {
 	var m Memory
 	var summary, originalID, refTarget sql.NullString
-	var embJSON []byte
 	var lastAccessed, createdAt int64
 	var expiresAt sql.NullInt64
 
 	err := row.Scan(
 		&m.ID, &m.Content, &summary, &originalID,
-		&m.Importance, &m.AccessCount, &lastAccessed, &createdAt, &m.Source, &embJSON,
+		&m.Importance, &m.AccessCount, &lastAccessed, &createdAt, &m.Source,
 		&m.AlwaysLoad, &expiresAt, &m.Tokens,
 		&m.RefType, &refTarget, &m.IsLazy,
 	)
@@ -175,29 +197,62 @@ func (s *Store) scanMemoryRow(row *sql.Rows) (Memory, error) {
 		m.ExpiresAt = &exp
 	}
 
-	if err := json.Unmarshal(embJSON, &m.Embedding); err != nil {
-		return m, err
-	}
-
 	return m, nil
 }
 
-// loadMemoryTags loads tags for a memory ID
-func (s *Store) loadMemoryTags(id string) ([]string, error) {
-	rows, err := s.db.Query("SELECT tag FROM memory_tags WHERE memory_id = ?", id)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// tagLookupChunkSize is how many memory ids go into one `IN (...)` list.
+//
+// It is a correctness bound, not a tuning knob. Every id becomes a bound
+// parameter, and SQLite refuses a statement with more parameters than
+// SQLITE_MAX_VARIABLE_NUMBER — measured against this driver, 32,766 ids answer
+// and 32,767 fail with "too many SQL variables". That ceiling has been 999 in
+// older SQLite builds, so the chunk stays under the lower of the two and the
+// query cannot depend on which build it is linked against.
+const tagLookupChunkSize = 900
 
-	var tags []string
-	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err == nil {
-			tags = append(tags, tag)
+// loadTagsForMemories returns the tags of every named memory, keyed by memory id.
+//
+// A memory with no tags is absent from the map rather than present and empty;
+// callers that need an empty slice should default it themselves.
+func (s *Store) loadTagsForMemories(ids []string) (map[string][]string, error) {
+	tagsByMemory := make(map[string][]string, len(ids))
+
+	for start := 0; start < len(ids); start += tagLookupChunkSize {
+		end := start + tagLookupChunkSize
+		if end > len(ids) {
+			end = len(ids)
 		}
+		chunk := ids[start:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+
+		query := "SELECT memory_id, tag FROM memory_tags WHERE memory_id IN (" +
+			join(placeholders, ",") + ")"
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("load tags for %d memories: %w", len(chunk), err)
+		}
+		for rows.Next() {
+			var memoryID, tag string
+			if err := rows.Scan(&memoryID, &tag); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan memory tag: %w", err)
+			}
+			tagsByMemory[memoryID] = append(tagsByMemory[memoryID], tag)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate memory tags: %w", err)
+		}
+		rows.Close()
 	}
-	return tags, nil
+
+	return tagsByMemory, nil
 }
 
 // partitionStableFirst moves volatile memories (file refs, recent files) to the end

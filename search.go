@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"strings"
+	"sort"
 	"time"
 )
 
@@ -103,49 +103,30 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 		return nil, fmt.Errorf("iterate rows: %w", err)
 	}
 
-	// Fetch tags for all memories in a single query
+	// Fetch tags for all candidates.
+	//
+	// This used to bind one parameter per candidate in a single IN list and then
+	// drop the resulting error, so a store with more live memories than SQLite
+	// accepts parameters answered 200 with every result's tag list empty.
+	// loadTagsForMemories chunks under that ceiling; a failure is now returned.
 	if len(memoryIDs) > 0 {
-		tagMap := make(map[string][]string)
-		
-		// Build IN clause
-		placeholders := make([]string, len(memoryIDs))
-		args := make([]interface{}, len(memoryIDs))
-		for i, id := range memoryIDs {
-			placeholders[i] = "?"
-			args[i] = id
+		tagsByMemory, err := s.loadTagsForMemories(memoryIDs)
+		if err != nil {
+			return nil, err
 		}
-		
-		tagQuery := fmt.Sprintf("SELECT memory_id, tag FROM memory_tags WHERE memory_id IN (%s)", 
-			strings.Join(placeholders, ","))
-		
-		tagRows, err := s.db.Query(tagQuery, args...)
-		if err == nil {
-			defer tagRows.Close()
-			for tagRows.Next() {
-				var memID, tag string
-				if err := tagRows.Scan(&memID, &tag); err == nil {
-					tagMap[memID] = append(tagMap[memID], tag)
-				}
-			}
-		}
-		
-		// Attach tags to memories
 		for i := range candidates {
-			candidates[i].memory.Tags = tagMap[candidates[i].memory.ID]
+			candidates[i].memory.Tags = tagsByMemory[candidates[i].memory.ID]
 			if candidates[i].memory.Tags == nil {
 				candidates[i].memory.Tags = []string{}
 			}
 		}
 	}
 
-	// Sort by score (descending)
-	for i := 0; i < len(candidates); i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].score > candidates[i].score {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
+	// Sort by score (descending). Ties keep the order the rows arrived in, which
+	// is what the exchange sort this replaces did not guarantee.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
 
 	// Take top N
 	if len(candidates) > limit {
