@@ -2,6 +2,7 @@
 package memorystore
 
 import (
+	"context"
 	"database/sql"
 	"time"
 )
@@ -57,7 +58,7 @@ type MemoryStore interface {
 	
 	// Context building and session preparation
 	BuildContext(req BuildContextRequest) ([]Memory, int, error)
-	PrepareSession(cfg PrepareSessionConfig) error
+	PrepareSession(ctx context.Context, cfg PrepareSessionConfig) error
 	
 	// Tool registry and usage tracking
 	LoadToolRegistry(tools []ToolMetadata) error

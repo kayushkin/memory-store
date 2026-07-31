@@ -1,6 +1,7 @@
 package memorystore
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,7 +70,7 @@ func TestPrepareSession(t *testing.T) {
 		RecentFilesTTL: 10 * time.Minute,
 	}
 
-	if err := store.PrepareSession(cfg); err != nil {
+	if err := store.PrepareSession(context.Background(), cfg); err != nil {
 		t.Fatalf("PrepareSession failed: %v", err)
 	}
 
@@ -195,7 +196,7 @@ func TestPrepareSession_WithIdentityFile(t *testing.T) {
 		RecencyWindow: 0, // disable recent files for this test
 	}
 
-	if err := store.PrepareSession(cfg); err != nil {
+	if err := store.PrepareSession(context.Background(), cfg); err != nil {
 		t.Fatalf("PrepareSession failed: %v", err)
 	}
 
