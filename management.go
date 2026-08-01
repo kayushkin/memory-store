@@ -8,16 +8,46 @@ import (
 	"time"
 )
 
-// Forget marks a memory as forgotten (soft delete by setting importance to 0).
+// Forget marks one memory as forgotten (soft delete by setting importance to 0).
+//
+// The id may be a prefix, for the same reason Get accepts one: a recall pointer
+// left in a conversation names the first eight characters of the id, and the
+// model forgets what it can name. So Forget resolves the prefix onto a row the
+// way Get does — escaped pattern, exact id beating a row that merely starts with
+// it — and then writes by the id that row actually carries.
+//
+// Resolving first is what keeps this a soft delete of ONE memory. Writing
+// `WHERE id = ? OR id LIKE ?` straight into the UPDATE forgets every row the
+// prefix reaches: "conversation-summary:<session>" takes every part written
+// under it, and the empty string takes the whole store. Both are reachable —
+// the memory_forget tool passes the model's id through unchecked — and both
+// report success, because RowsAffected is only ever read for zero.
 func (s *Store) Forget(id string) error {
-	query := `UPDATE memories SET importance = 0 WHERE id = ? OR id LIKE ?`
-	res, err := s.db.Exec(query, id, id+"%")
+	if id == "" {
+		return fmt.Errorf("forget memory: id required")
+	}
+
+	// The ORDER BY says an exact id beats a row that merely starts with it. It
+	// is a statement of intent rather than a fix: measured, SQLite answers this
+	// query with a covering scan of the id primary-key index, so rows arrive in
+	// lexicographic order and a prefix always sorts before its extensions —
+	// removing the clause leaves every test green today. It earns its place by
+	// not depending on that plan, which a later index or predicate can change.
+	var resolved string
+	err := s.db.QueryRow(`
+	SELECT id FROM memories
+	WHERE id = ? OR id LIKE ? ESCAPE '\'
+	ORDER BY (id = ?) DESC
+	`, id, likePrefixPattern(id), id).Scan(&resolved)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("memory not found: %s", id)
+	}
 	if err != nil {
 		return fmt.Errorf("forget memory: %w", err)
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("memory not found: %s", id)
+
+	if _, err := s.db.Exec(`UPDATE memories SET importance = 0 WHERE id = ?`, resolved); err != nil {
+		return fmt.Errorf("forget memory: %w", err)
 	}
 	return nil
 }
