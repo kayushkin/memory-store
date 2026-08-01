@@ -5,12 +5,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
 // Close closes the database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// likePrefixPattern turns a literal id into a LIKE pattern that matches the ids
+// starting with it, and nothing else.
+//
+// LIKE reads `%` and `_` as wildcards, and memory ids are not opaque UUIDs here:
+// inber writes "conversation-summary:<session-id>:<suffix>", and a session id
+// carrying an underscore would otherwise make that position match any character
+// — the caller asks for one memory by id and Get answers with a different one.
+// The backslash escape is declared by the ESCAPE clause at every call site.
+func likePrefixPattern(id string) string {
+	var b strings.Builder
+	b.Grow(len(id) + 1)
+	for _, r := range id {
+		if r == '%' || r == '_' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('%')
+	return b.String()
 }
 
 // Save stores a new memory.
@@ -106,14 +128,28 @@ func (s *Store) Save(m Memory) error {
 }
 
 // Get retrieves a memory by ID and updates access tracking.
+//
+// The id may be a prefix of the stored id: writers that leave a recall pointer
+// in a conversation abbreviate it (conversation.StashLargeContent names the
+// first eight characters of a UUID), so the read that pointer names has to
+// resolve the same row from less than the whole id.
+//
+// Everything after the row lookup therefore keys on the id the row actually
+// carries, never on the prefix the caller passed. Keyed on the prefix, the tag
+// query and the access update both match zero rows: Get returned a memory with
+// no tags and reported an access-count bump that was never written, which is a
+// return value lying about a write.
 func (s *Store) Get(id string) (*Memory, error) {
-	// Support prefix matching (e.g., first 8 chars of UUID)
+	// An exact id beats a prefix of it. Without the ordering, a store holding
+	// both "abc123" and "abc123-derived" answers Get("abc123") with whichever
+	// row SQLite reaches first, so the caller silently reads the wrong memory.
 	query := `
 	SELECT id, content, summary, original_id, importance, access_count, last_accessed, created_at, source, embedding, always_load, expires_at, tokens, ref_type, ref_target, is_lazy, orchestrator
 	FROM memories
-	WHERE id = ? OR id LIKE ?
+	WHERE id = ? OR id LIKE ? ESCAPE '\'
+	ORDER BY (id = ?) DESC
 	`
-	row := s.db.QueryRow(query, id, id+"%")
+	row := s.db.QueryRow(query, id, likePrefixPattern(id), id)
 
 	var m Memory
 	var summary, originalID, refTarget sql.NullString
@@ -155,8 +191,9 @@ func (s *Store) Get(id string) (*Memory, error) {
 		return nil, fmt.Errorf("unmarshal embedding: %w", err)
 	}
 
-	// Fetch tags
-	tagRows, err := s.db.Query("SELECT tag FROM memory_tags WHERE memory_id = ?", id)
+	// Fetch tags. Keyed on the resolved row id, not the caller's, which may be
+	// a prefix that matches no memory_tags row.
+	tagRows, err := s.db.Query("SELECT tag FROM memory_tags WHERE memory_id = ?", m.ID)
 	if err != nil {
 		return nil, fmt.Errorf("query tags: %w", err)
 	}
@@ -171,9 +208,10 @@ func (s *Store) Get(id string) (*Memory, error) {
 		m.Tags = append(m.Tags, tag)
 	}
 
-	// Update access tracking synchronously
-	s.updateAccess(id)
-	
+	// Update access tracking synchronously, on the resolved row id for the same
+	// reason as the tags above.
+	s.updateAccess(m.ID)
+
 	// Update the returned struct to reflect the access tracking changes
 	m.AccessCount++
 	m.LastAccessed = time.Now()
