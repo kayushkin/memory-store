@@ -122,10 +122,19 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 		}
 	}
 
-	// Sort by score (descending). Ties keep the order the rows arrived in, which
-	// is what the exchange sort this replaces did not guarantee.
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
+	// Sort by score (descending), breaking ties on id.
+	//
+	// This used to be a stable sort whose comment said ties "keep the order the
+	// rows arrived in". Stability was the wrong guarantee to reach for: the
+	// query above has no ORDER BY, so the arrival order it preserved was itself
+	// undefined, and the top-N cut below then admitted whichever tied memories
+	// SQLite happened to hand over first. Ids are unique, so deciding on them
+	// makes the comparator total and the result a function of the candidate set.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		return candidates[i].memory.ID < candidates[j].memory.ID
 	})
 
 	// Take top N

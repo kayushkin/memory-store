@@ -44,6 +44,14 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 	// per row to throw it away, which was the single largest cost in this
 	// function. Search is the path that ranks by embedding, and it still selects
 	// it.
+	//
+	// There is deliberately no ORDER BY. The ordering contract lives in the
+	// comparator below, which is total, so the result does not depend on the
+	// order rows arrive in and an ORDER BY would only pay for it twice. It is
+	// not free either: `ORDER BY id` turns this from
+	// `SEARCH memories USING INDEX idx_importance (importance>?)` into a full
+	// `SCAN memories USING INDEX sqlite_autoindex_memories_1`, which on the
+	// largest store on this host reads all 35,764 rows to find the 47 live ones.
 	now := time.Now()
 	query := `
 	SELECT id, content, summary, original_id, importance, access_count, last_accessed, created_at, source, always_load, expires_at, tokens, ref_type, ref_target, is_lazy
@@ -112,7 +120,26 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 		candidates[i].score = calculateScore(candidates[i].memory, tagSet)
 	}
 
-	// Sort by priority
+	// Sort by priority.
+	//
+	// The comparator is total — every pair of distinct candidates is decided,
+	// with id as the last resort — and that is load-bearing, not tidiness. The
+	// survivors of the budget cut below become the entire `system` array of an
+	// Anthropic request and carry a cache breakpoint. Anthropic hashes
+	// tools -> system -> messages in order, so two memories swapping places
+	// invalidate that breakpoint and every breakpoint after it, and the whole
+	// conversation is re-charged at the 1.25x cache-write rate instead of the
+	// 0.10x read rate.
+	//
+	// Leaving a pair undecided does not merely leave their order arbitrary:
+	// sort.Slice is pdqsort, whose placement of equal elements depends on the
+	// whole input, so an undecided pair makes the OUTPUT depend on the order
+	// SQLite handed the rows over in. That order is not fixed either — the scan
+	// runs on idx_importance, and updateAccess multiplies importance by 1.01 on
+	// every read while DecayImportance multiplies it by 0.99 daily, so rows move
+	// within that index constantly. Measured with the tie-break removed: the
+	// same forty equally-scoring memories, written in the opposite order, put a
+	// completely disjoint set of ten in the prompt.
 	sort.Slice(candidates, func(i, j int) bool {
 		// AlwaysLoad memories always come first
 		if candidates[i].memory.AlwaysLoad != candidates[j].memory.AlwaysLoad {
@@ -122,8 +149,12 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 		if candidates[i].score != candidates[j].score {
 			return candidates[i].score > candidates[j].score
 		}
-		// Tie-breaker: smaller memories first (more likely to fit)
-		return candidates[i].memory.Tokens < candidates[j].memory.Tokens
+		// Then smaller memories first (more likely to fit)
+		if candidates[i].memory.Tokens != candidates[j].memory.Tokens {
+			return candidates[i].memory.Tokens < candidates[j].memory.Tokens
+		}
+		// Ids are unique, so nothing below this line is undecided.
+		return candidates[i].memory.ID < candidates[j].memory.ID
 	})
 
 	// Set truncation defaults
