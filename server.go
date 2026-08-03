@@ -79,9 +79,16 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	if m.Importance == 0 {
 		m.Importance = 0.5
 	}
-	if m.Source == "" {
-		m.Source = "user"
-	}
+	// A caller that names no source gets no source. This used to default to
+	// "user", which is not a neutral choice: "user" is the most trusted
+	// provenance a memory can carry, so every write that simply omitted the
+	// field was recorded as something the user had said. The store cannot know
+	// who a caller is speaking for, and guessing the top of the trust order is
+	// the wrong way to be wrong.
+	//
+	// Importance above is a genuine default — 0.5 is the middle of its range
+	// and says nothing. There is no middle of the trust order, so there is
+	// nothing for Source to default to.
 
 	if err := h.s.Save(m); err != nil {
 		writeErr(w, 500, err.Error())
