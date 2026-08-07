@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -327,14 +328,24 @@ func partitionStableFirst(memories []Memory) []Memory {
 
 // isVolatileMemory returns true for memories that change between turns
 // (file references from tool calls, recent file scans).
+//
+// The prefix tests are strings.HasPrefix and must stay that way. They were
+// hand-rolled as `len(m.ID) > 8 && m.ID[:8] == "fileref:"`, which is HasPrefix
+// with the boundary wrong: an id that is EXACTLY the bare prefix has length 8,
+// fails `> 8`, and was classified stable. inber implements the same predicate
+// over the same ids with strings.HasPrefix (engine/turn_prompt.go
+// isVolatileMemoryID), so the two copies disagreed on precisely those ids —
+// one would park such a memory in the cached system prefix while the other
+// treated it as volatile. Degenerate, but it is a divergence between two rules
+// that are supposed to be one, and it cost nothing to remove.
 func isVolatileMemory(m Memory) bool {
-	if len(m.ID) > 8 && m.ID[:8] == "fileref:" {
+	if strings.HasPrefix(m.ID, "fileref:") {
 		return true
 	}
-	if len(m.ID) > 7 && m.ID[:7] == "recent:" {
+	if strings.HasPrefix(m.ID, "recent:") {
 		return true
 	}
-	if len(m.ID) > 5 && m.ID[:5] == "file:" {
+	if strings.HasPrefix(m.ID, "file:") {
 		return true
 	}
 	for _, tag := range m.Tags {
