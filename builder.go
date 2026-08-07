@@ -145,6 +145,31 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 		if candidates[i].memory.AlwaysLoad != candidates[j].memory.AlwaysLoad {
 			return candidates[i].memory.AlwaysLoad
 		}
+		// Within the always-load head, order by id and nothing else.
+		//
+		// Score cannot decide MEMBERSHIP here: the budget cut below appends an
+		// always-load memory whether or not it fits, so every always-load
+		// candidate reaches the result and the running token total after the
+		// head is the same whatever order they went in. Score can only decide
+		// their BYTES — and it is the wrong thing to decide them with, because
+		// every one of its three inputs varies from turn to turn while the head
+		// itself does not. calculateScore adds 0.3 per tag matching the current
+		// user message, adds a wall-clock recency bonus that steps down as
+		// last_accessed crosses one day and one week, and starts from an
+		// importance that updateAccess multiplies by 1.01 on every read and
+		// DecayImportance multiplies by 0.99 daily. Sorting the head by any of
+		// those lets a memory move for reasons that have nothing to do with the
+		// head's contents, and this head is the front of the `system` array
+		// that carries the caller's cache breakpoint — so a swap here
+		// invalidates it and every breakpoint after it, re-charging the whole
+		// conversation at the write rate.
+		//
+		// Ids are unique and do not drift, so this is total on its own and the
+		// head's order is fixed by construction rather than by the scores
+		// happening not to cross.
+		if candidates[i].memory.AlwaysLoad {
+			return candidates[i].memory.ID < candidates[j].memory.ID
+		}
 		// Then by score
 		if candidates[i].score != candidates[j].score {
 			return candidates[i].score > candidates[j].score
