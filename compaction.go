@@ -2,9 +2,53 @@ package memorystore
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
+
+// compactionGroupKeyForMemory returns the key a memory compacts under, and the
+// primary tag to name the resulting compacted memory after. Two defects are
+// fixed here; both merged memories that have nothing to do with each other, and
+// compaction destroys the originals, so neither is cosmetic.
+//
+// 1. An untagged memory used to key on the literal "untagged". That is not an
+// identity, it is the ABSENCE of one, worn by every memory the tagger could not
+// classify — and the tagger classifies far less than it looks: Tag() has no
+// case for source "agent", so ordinary agent prose gets no tags at all.
+// Measured before the fix: three untagged memories on the front door key, a
+// postgres pool size and a birthday merged into one memory and the originals
+// were soft-deleted. The fix is a SUBSTITUTE IDENTITY rather than an exclusion
+// — the memory's own id, which is unique, so it falls through to the
+// len(members) < 2 skip below and is never merged with a stranger. Excluding
+// untagged memories from the candidate query instead would look equivalent and
+// is not: it would also hide them from any future grouping that CAN key them.
+//
+// 2. A tagged memory used to key on tags[0], which is not stable. Tag() builds
+// its result by ranging a Go map, so the order is randomised per call and then
+// frozen into memory_tags at save time. Measured over 200 calls on identical
+// input: five different tags came back first (user 95, config.yaml 29,
+// identity 28, error 24, hosts 24). Two memories with the same tag set landed
+// in different groups by luck. Sorting makes the key deterministic.
+//
+// ⚠️ Sorting fixes the INSTABILITY, not the arbitrariness: the
+// alphabetically-first tag is still a poor stand-in for what a memory is about,
+// and {code,error} and {code,web} still group together under "code" while
+// {error,web} does not. Whether this should key on the whole tag set instead is
+// a real change in which memories merge, so it is filed as a decision rather
+// than made here — noteboard todo f06202e9.
+//
+// The two prefixes keep the namespaces apart: without them a memory literally
+// tagged "untagged" would land in the same group as the untagged ones, which is
+// the exact collision this function exists to stop.
+func compactionGroupKeyForMemory(memoryID string, tags []string) (key, primaryTag string) {
+	if len(tags) == 0 {
+		return "memory-id:" + memoryID, "untagged"
+	}
+	sorted := append([]string(nil), tags...)
+	sort.Strings(sorted)
+	return "tag:" + sorted[0], sorted[0]
+}
 
 // CompactionResult describes what was compacted.
 type CompactionResult struct {
@@ -76,16 +120,17 @@ func (s *Store) Compact(minAge time.Duration, minCount int) ([]CompactionResult,
 		}
 	}
 
-	// Group by primary tag (first tag, or "untagged")
+	// Group by primary tag. Compaction MERGES content and destroys the
+	// originals, so the grouping key has to be a real identity. It was not, in
+	// two separate ways, and both are load-bearing — read before changing.
 	groups := make(map[string][]candidate)
 	groupTags := make(map[string]map[string]bool)
+	groupPrimaryTag := make(map[string]string)
 	for _, c := range candidates {
 		tags := tagMap[c.id]
-		key := "untagged"
-		if len(tags) > 0 {
-			key = tags[0]
-		}
+		key, primaryTag := compactionGroupKeyForMemory(c.id, tags)
 		groups[key] = append(groups[key], c)
+		groupPrimaryTag[key] = primaryTag
 		if groupTags[key] == nil {
 			groupTags[key] = make(map[string]bool)
 		}
@@ -119,7 +164,7 @@ func (s *Store) Compact(minAge time.Duration, minCount int) ([]CompactionResult,
 			allTags = append(allTags, t)
 		}
 
-		newID := fmt.Sprintf("compact-%s-%d", groupKey, time.Now().UnixNano())
+		newID := fmt.Sprintf("compact-%s-%d", groupPrimaryTag[groupKey], time.Now().UnixNano())
 		newMem := Memory{
 			ID:         newID,
 			Content:    fmt.Sprintf("[Compacted from %d memories]\n%s", len(members), combined),
