@@ -378,7 +378,12 @@ func truncateMemoryToPreview(m Memory, previewChars int) Memory {
 		return m
 	}
 
-	preview := content[:previewChars]
+	// The word/line walk-back below is already rune-safe, because neither a
+	// space nor a newline can appear inside a multi-byte UTF-8 sequence. This
+	// first cut is not, and it is what survives when the walk-back finds no
+	// break past halfway — which is the usual case for scripts that do not
+	// separate words with an ASCII space.
+	preview := truncateAtRuneBoundary(content, previewChars)
 	// Try to break at a word/line boundary
 	if lastNewline := lastIndexByte(preview, '\n'); lastNewline > previewChars/2 {
 		preview = preview[:lastNewline]

@@ -153,9 +153,12 @@ func (s *Store) Compact(minAge time.Duration, minCount int) ([]CompactionResult,
 			parts = append(parts, m.content)
 			origIDs = append(origIDs, m.id)
 		}
+		// This cut has to respect rune boundaries. Compaction saves the merged
+		// content and then soft-deletes the originals, so a rune split here is
+		// not a display glitch — it is the surviving copy of the memory.
 		combined := strings.Join(parts, "\n---\n")
 		if len(combined) > 2000 {
-			combined = combined[:2000] + "..."
+			combined = truncateAtRuneBoundary(combined, 2000) + "..."
 		}
 
 		// Collect all tags for the group
