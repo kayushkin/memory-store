@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/kayushkin/memory-store/internal/textutil"
 )
 
 // ToolMetadata represents metadata about an available tool
@@ -44,7 +46,7 @@ func (s *Store) LoadToolRegistry(tools []ToolMetadata) error {
 
 	for _, category := range catNames {
 		categoryTools := categories[category]
-		builder.WriteString(fmt.Sprintf("## %s\n\n", strings.Title(category)))
+		builder.WriteString(fmt.Sprintf("## %s\n\n", textutil.TitleFirstRuneOfEachWord(category)))
 		for _, tool := range categoryTools {
 			builder.WriteString(fmt.Sprintf("- **%s**: %s\n", tool.Name, tool.Description))
 		}
