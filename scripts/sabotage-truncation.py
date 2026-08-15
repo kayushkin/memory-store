@@ -1,9 +1,20 @@
-"""Sabotage-score the rune-boundary truncation tests.
+"""Sabotage-score the rune-boundary truncation tests and their budgets.
 
-A suite that passes tells you nothing on its own. This breaks the fix in six
-ways and checks that the tests notice five of them and, just as importantly,
-do NOT notice the sixth. A scorer with no known-negative control reports
-CAUGHT for everything and looks perfect while measuring nothing.
+A suite that passes tells you nothing on its own. This puts a defect back one at
+a time and checks that the tests notice it — and, for the two known-negative
+controls, that they do NOT. A scorer with no control reports CAUGHT for
+everything and looks perfect while measuring nothing.
+
+The list has two halves and they ask different questions.
+
+MECHANISM rows break the fix itself: a walk-back that stops running, a cut that
+overshoots, a call site that reverts to a plain byte cut.
+
+VALUE rows move a numeric literal by one unit — a budget, a guard's threshold, a
+divisor. Neither a mutation score nor a function-name census asks whether the
+NUMBER a mechanism compares against is observed, and this list scored 6/6 on its
+mechanisms while 15 of 18 value moves went unnoticed. A far move (2000 -> 20000)
+is a deletion wearing a number and does not count; move the literal by one.
 
 Two of these cases have to be written as drifted comparisons rather than
 deletions: removing the walk-back orphans the utf8 import, and `go test` runs
@@ -132,9 +143,104 @@ CASES = [
   # reports CAUGHT for this is reporting CAUGHT for everything.
   ("CONTROL (no-op): the maxBytes guard narrows from <=0 to <0",
    "util.go", "if maxBytes <= 0 {", "if maxBytes < 0 {", False),
+
+  # -----------------------------------------------------------------------
+  # Boundary VALUES, added by the 184th nightly pass under card 23be5012.
+  #
+  # Every row above moves a MECHANISM: a walk-back that stops running, a call
+  # site that reverts to a byte cut. None of them asks whether the NUMBER the
+  # code compares against is observed. A mutation score and a function-name
+  # census both answer the first question and neither answers the second, so a
+  # list can read 6/6 while every literal in its three targets is free to drift.
+  #
+  # Each row below moves ONE literal by ONE unit, or swaps one comparison for
+  # its adjacent neighbour. A far move (2000 -> 20000) is a deletion wearing a
+  # number and is already covered by the mechanism rows.
+  ("VALUE: the maxBytes guard widens from <=0 to <=1, so a 1-byte budget yields nothing",
+   "util.go", "if maxBytes <= 0 {", "if maxBytes <= 1 {", True),
+  ("VALUE: the already-fits test admits one byte over budget",
+   "util.go", "if len(s) <= maxBytes {", "if len(s) <= maxBytes+1 {", True),
+  ("VALUE: the already-fits test rejects an exact fit",
+   "util.go", "if len(s) <= maxBytes {", "if len(s) < maxBytes {", True),
+  ("VALUE: the walk-back stops one byte short of the front",
+   "util.go", "for cut > 0 && !utf8.RuneStart(s[cut]) {", "for cut > 1 && !utf8.RuneStart(s[cut]) {", True),
+
+  ("VALUE: the compaction cut fires one byte later (2000 -> 2001)",
+   "compaction.go", "if len(combined) > 2000 {", "if len(combined) > 2001 {", True),
+  ("VALUE: the compaction budget shrinks by one byte (2000 -> 1999)",
+   "compaction.go", "truncateAtRuneBoundary(combined, 2000)", "truncateAtRuneBoundary(combined, 1999)", True),
+  ("VALUE: the compaction budget grows past its own guard (2000 -> 2001)",
+   "compaction.go", "truncateAtRuneBoundary(combined, 2000)", "truncateAtRuneBoundary(combined, 2001)", True),
+  ("VALUE: the minimum compactable group size moves 2 -> 3",
+   "compaction.go", "if len(members) < 2 {", "if len(members) < 3 {", True),
+  ("VALUE: the compactable importance ceiling moves 0.7 -> 0.6",
+   "compaction.go", "importance < 0.7", "importance < 0.6", True),
+  ("VALUE: the compactable importance floor moves 0 -> 0.1",
+   "compaction.go", "importance > 0", "importance > 0.1", True),
+  ("VALUE: the compacted memory's own importance moves 0.5 -> 0.6",
+   "compaction.go", "Importance: 0.5,", "Importance: 0.6,", True),
+
+  # Known-NEGATIVE control, and it took a sweep to earn the classification.
+  # `len(content) <= previewChars` is a fast path with nothing under it: for
+  # every previewChars >= 1 the >50% rule four lines below returns the memory
+  # unchanged for exactly the same inputs. Swept over previewChars 0..60 at the
+  # only length where the two guards can disagree — ONE input differs,
+  # previewChars=0, and BuildContext (the sole call site) substitutes 300 for a
+  # TruncatePreview of zero before it gets here.
+  #
+  # FALSIFICATION: TestPreviewLeavesContentOneByteOverTheBudgetWhole holds the
+  # claim. If the >50% rule is narrowed so it stops dominating this guard, that
+  # test goes red and this row must become expect=True.
+  ("CONTROL (dominated): the already-small-enough fast path admits one byte over",
+   "builder.go", "if len(content) <= previewChars {", "if len(content) <= previewChars+1 {", False),
+  ("VALUE: the default preview budget moves 300 -> 301",
+   "builder.go", "truncatePreview = 300", "truncatePreview = 301", True),
+  ("VALUE: the default preview budget moves 300 -> 299",
+   "builder.go", "truncatePreview = 300", "truncatePreview = 299", True),
+  ("VALUE: the default-preview guard widens from <=0 to <=1",
+   "builder.go", "if truncatePreview <= 0 {", "if truncatePreview <= 1 {", True),
+  ("VALUE: the truncate threshold fires on equality instead of above it",
+   "builder.go", "m.Tokens > truncateThreshold", "m.Tokens >= truncateThreshold", True),
+  ("VALUE: the >50%-of-content skip rule widens to >33%",
+   "builder.go", "if previewChars*2 >= len(content) {", "if previewChars*3 >= len(content) {", True),
+  ("VALUE: the >50% skip rule loses its equality, so an exact half truncates",
+   "builder.go", "if previewChars*2 >= len(content) {", "if previewChars*2 > len(content) {", True),
+  ("VALUE: the newline walk-back accepts a break exactly on halfway",
+   "builder.go", "lastNewline > previewChars/2", "lastNewline >= previewChars/2", True),
+  ("VALUE: the space walk-back's halfway mark becomes a third",
+   "builder.go", "lastSpace > previewChars/2", "lastSpace > previewChars/3", True),
+  ("VALUE: the omitted-token estimate divides by 4 instead of 3",
+   "builder.go", "m.Tokens - (len(preview)+2)/3", "m.Tokens - (len(preview)+2)/4", True),
+  ("VALUE: the truncated memory's token estimate divides by 4 instead of 3",
+   "builder.go", "(len(m.Content) + 2) / 3", "(len(m.Content) + 2) / 4", True),
 ]
 
-TESTS = "TestTruncateAtRuneBoundary|TestTruncateAtRuneBoundaryEdgeCases|TestCompactionContentStaysValidUTF8|TestTruncateMemoryToPreviewStaysValidUTF8"
+# Go's -run matches unanchored, so a prefix here pulls in every test that starts
+# with it. Each name is still spelled out: a list that relies on prefix matching
+# silently gains and loses targets as tests are renamed, and the score would move
+# with no case-list edit to explain it.
+TESTS = "|".join((
+    # The mechanism suite.
+    "TestTruncateAtRuneBoundary",
+    "TestTruncateAtRuneBoundaryEdgeCases",
+    "TestCompactionContentStaysValidUTF8",
+    "TestTruncateMemoryToPreviewStaysValidUTF8",
+    # The boundary-VALUE suite, boundary_values_test.go.
+    "TestTruncateAtRuneBoundaryKeepsASingleByteBudget",
+    "TestCompactionKeepsExactlyTwoThousandBytes",
+    "TestCompactionCutFiresExactlyAboveItsBudget",
+    "TestCompactionNeedsExactlyTwoMembers",
+    "TestCompactionImportanceWindowIsPinnedToItsValues",
+    "TestCompactedMemoryTakesImportanceOneHalf",
+    "TestPreviewCutIsPinnedToItsBudget",
+    "TestPreviewSkipRuleStraddlesHalfTheContent",
+    "TestPreviewWordBreakStraddlesHalfway",
+    "TestTruncatedPreviewSpellsItsTokenCounts",
+    "TestPreviewLeavesContentOneByteOverTheBudgetWhole",
+    "TestBuildContextPreviewDefaultsToThreeHundredBytes",
+    "TestBuildContextHonoursAOneBytePreview",
+    "TestTruncateThresholdStraddlesItsOwnValue",
+))
 
 def restore():
     subprocess.run(["git","checkout","--","util.go","compaction.go","builder.go"], cwd=REPO, check=True)
