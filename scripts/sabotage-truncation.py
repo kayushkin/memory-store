@@ -242,8 +242,34 @@ TESTS = "|".join((
     "TestTruncateThresholdStraddlesItsOwnValue",
 ))
 
+MUTATED_FILES = ["util.go","compaction.go","builder.go"]
+
+
+# `restore()` below is `git checkout --`, so it puts these files back to HEAD. It
+# cannot tell a mutation this scorer wrote from work somebody has not committed
+# yet, and it runs at the TOP of every case, before anything is read. So scoring a
+# fix that is written but not yet committed deletes the fix and scores HEAD.
+#
+# The symptom accuses the wrong file. Every case then prints
+# `SETUP FAIL: pattern not found`, which reads as a stale case list — so the
+# obvious next move is to edit the case list, against a source file the scorer has
+# already reverted. Nothing in that output mentions the checkout. Measured in
+# memory-store by the 239th nightly pass: eight rows read SETUP FAIL and the ninth
+# read ok, and the loss was found by being bitten rather than by reading.
+#
+# The shared engine (tool-store scripts/sabotage.py) has refused this for a long
+# time. This scorer does not import the engine, so it never inherited the refusal.
+_dirty = subprocess.run(["git", "status", "--porcelain", "--"] + MUTATED_FILES,
+                        cwd=REPO, capture_output=True, text=True,
+                        check=True).stdout.strip()
+if _dirty:
+    sys.exit("REFUSING: these have uncommitted changes; this harness restores "
+             "from git and would delete them:\n%s" % _dirty)
+
+
 def restore():
-    subprocess.run(["git","checkout","--","util.go","compaction.go","builder.go"], cwd=REPO, check=True)
+    subprocess.run(["git", "checkout", "--"] + MUTATED_FILES,
+                   cwd=REPO, check=True)
 
 score = 0
 # The file under test holds a deliberately broken version of itself from the write
