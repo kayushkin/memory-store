@@ -41,22 +41,9 @@ func (s *Store) scanMemory(scanner interface {
 	return m, nil
 }
 
-// loadTags loads tags for a given memory ID
-func (s *Store) loadTags(memoryID string) ([]string, error) {
-	rows, err := s.db.Query("SELECT tag FROM memory_tags WHERE memory_id = ?", memoryID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tags []string
-	for rows.Next() {
-		var tag string
-		if err := rows.Scan(&tag); err != nil {
-			continue
-		}
-		tags = append(tags, tag)
-	}
-
-	return tags, nil
-}
+// loadTags is gone deliberately. It read one memory's tags per call and
+// discarded a row-scan failure with `continue`, and its last caller was the
+// swallow in ListByOrchestrator. Every tag lookup now goes through
+// loadTagsForMemories (builder.go), which is batched, chunked under SQLite's
+// bound-parameter ceiling, and returns its errors. A second tag-loading path is
+// how one site came to be repaired and the other left broken.

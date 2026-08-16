@@ -125,13 +125,29 @@ func (s *Store) ListByOrchestrator(orchestrator string, limit int, minImportance
 		return nil, fmt.Errorf("iterate rows: %w", err)
 	}
 
-	// Load tags
-	for i := range result {
-		tags, _ := s.loadTags(result[i].ID)
-		if tags != nil {
-			result[i].Tags = tags
-		} else {
-			result[i].Tags = []string{}
+	// Fetch tags for the whole page in one lookup.
+	//
+	// This used to call loadTags once per memory and throw the error away, so a
+	// tag lookup that could not run handed back every memory with an empty tag
+	// list and a nil error — the same answer a page of genuinely untagged
+	// memories gives. searchInternal (search.go) carried the identical swallow,
+	// was repaired, and this site was left behind; loadTagsForMemories is the
+	// helper that repair introduced. It chunks under SQLite's bound-parameter
+	// ceiling and returns its failures, so both callers now fail the same way.
+	if len(result) > 0 {
+		ids := make([]string, len(result))
+		for i := range result {
+			ids[i] = result[i].ID
+		}
+		tagsByMemory, err := s.loadTagsForMemories(ids)
+		if err != nil {
+			return nil, err
+		}
+		for i := range result {
+			result[i].Tags = tagsByMemory[result[i].ID]
+			if result[i].Tags == nil {
+				result[i].Tags = []string{}
+			}
 		}
 	}
 
