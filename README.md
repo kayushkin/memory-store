@@ -1,8 +1,8 @@
 # memory-store
 
-Persistent vector memory with semantic search for the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem.
+Persistent memory with full-text search for the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem.
 
-SQLite-backed memory store that gives AI agents cross-session knowledge retention. Memories are embedded as TF-IDF vectors for semantic search, scored by importance and recency, and automatically decayed and compacted over time. A context builder assembles optimal prompt context within a token budget.
+SQLite-backed memory store that gives AI agents cross-session knowledge retention. Memories are ranked by BM25 relevance over an FTS5 index, weighted by importance and recency, and automatically decayed and compacted over time. A context builder assembles prompt context within a token budget.
 
 ```
   ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
@@ -17,8 +17,8 @@ SQLite-backed memory store that gives AI agents cross-session knowledge retentio
   ║   ┌──────────────────────────▼─────────────────────────┐   ║
   ║   │                    MemoryStore                     │   ║
   ║   │                                                    │   ║
-  ║   │  Save ─── upsert with auto-embedding & tagging    │   ║
-  ║   │  Search ─ semantic search with scoring             │   ║
+  ║   │  Save ─── upsert with auto-indexing & tagging      │   ║
+  ║   │  Search ─ BM25 relevance, weighted by importance   │   ║
   ║   │  BuildContext ─ token-budgeted prompt assembly     │   ║
   ║   │  PrepareSession ─ load identity, tools, files      │   ║
   ║   │  Decay / Compact ─ lifecycle management            │   ║
@@ -26,8 +26,8 @@ SQLite-backed memory store that gives AI agents cross-session knowledge retentio
   ║   └──────────────────────────┬─────────────────────────┘   ║
   ║                              │                             ║
   ║   ┌──────────────────────────▼─────────────────────────┐   ║
-  ║   │                SQLite + TF-IDF                     │   ║
-  ║   │          256-dim vectors · cosine similarity       │   ║
+  ║   │              SQLite + FTS5 (porter)                │   ║
+  ║   │        bm25() · importance · recency decay         │   ║
   ║   └────────────────────────────────────────────────────┘   ║
   ╚════════════════════════════════════════════════════════════╝
 ```
@@ -52,7 +52,7 @@ store.Save(memorystore.Memory{
     Tags:       []string{"preference", "style"},
 })
 
-// Semantic search
+// Full-text search
 results, _ := store.Search("response style", 5)
 
 // Build prompt context within a token budget
@@ -112,7 +112,7 @@ Registered via `RegisterHandlers(mux, store)`:
 | `POST` | `/memories` | Save or upsert a memory |
 | `GET` | `/memories/{id}` | Get a memory by ID |
 | `DELETE` | `/memories/{id}` | Forget a memory (soft-delete via importance=0) |
-| `POST` | `/memories/search` | Semantic search with optional orchestrator filter |
+| `POST` | `/memories/search` | Full-text search with optional orchestrator filter |
 | `GET` | `/memories/recent` | List recent memories (`?limit=20&min_importance=0.5`) |
 | `POST` | `/memories/decay` | Apply importance decay to stale memories |
 | `POST` | `/memories/compact` | Compress old, low-access memories |
@@ -146,7 +146,9 @@ type MemoryStore interface {
 
 ### Memory structure
 
-Each memory has content, a 256-dimensional TF-IDF embedding, an importance score (0-1), tags, and metadata tracking access count and timestamps. Memories can be scoped to a specific orchestrator for multi-agent isolation.
+Each memory has content, an importance score (0-1), tags, and metadata tracking access count and timestamps. Memories can be scoped to a specific orchestrator for multi-agent isolation.
+
+The `Embedding` field is still written and returned, and nothing ranks on it any more — see the note under **Search** below.
 
 | Field | Description |
 |-------|-------------|
@@ -160,15 +162,36 @@ Each memory has content, a 256-dimensional TF-IDF embedding, an importance score
 | `RefTarget` | File path or URL for lazy-loaded references |
 | `Orchestrator` | Multi-tenant scoping (`inber`, `openclaw`, etc.) |
 
-### Semantic search
+### Search
 
-Memories are embedded as 256-dimensional TF-IDF vectors using hash bucketing. Search scores combine three signals:
+Content and summary are indexed into an SQLite FTS5 table with the `porter unicode61` tokenizer, so `scheduling` finds `scheduler`. A query is tokenized, stop words are dropped, and each remaining term is quoted and OR-ed — quoting is what stops a query containing `NEAR`, `OR`, `*` or a stray quote from being read as FTS5 syntax rather than as words.
+
+Search scores combine three signals:
 
 ```
-score = cosineSimilarity × importance × recencyBoost
+score = -bm25(memories_fts) × importance × recencyBoost
 ```
 
-Recency boost decays exponentially: `0.99^daysSinceAccess`. Accessing a memory boosts its importance by 1% (capped at 1.0).
+`bm25()` is negative and orders ascending, so the sign flip turns it into a score that composes with the other two. Recency decays exponentially: `0.99^daysSinceAccess`. Accessing a memory boosts its importance by 1% (capped at 1.0).
+
+Two behaviours are worth knowing:
+
+- **A query that matches nothing returns nothing.** It used to return the store's first `limit` rows sorted by id, because an unmatched query scored 0 against everything and 0 sorts as a tie.
+- **When BM25 separates no candidate from another** — every query term appears in every matched memory, so every term has zero IDF — importance and recency decide the order instead of the id tie-break.
+
+#### What this replaced, and by how much
+
+Search used to score the cosine similarity of a 256-bucket hashed bag of words. It was described here and in its own doc comment as TF-IDF, and it had no IDF of any kind: every term counted the same whether it appeared in one memory or in all of them, unrelated words sharing a hash bucket scored as a match, and nothing was stemmed.
+
+`TestBM25OutranksTheHashedBagOfWords` runs both retrievers over one labelled corpus of 40 memories and 10 queries and is the measurement behind the switch:
+
+| metric | BM25 | hashed bag of words |
+|---|---|---|
+| precision over results returned | **0.833** | 0.533 |
+| recall@3 | **1.000** | 0.933 |
+| MRR | 1.000 | 1.000 |
+
+MRR is reported and deliberately **not** asserted on. Both retrievers put a relevant memory first on all ten queries, so the old one was never bad at finding the single best match — it was bad at everything after it, padding the rest of the context budget with memories that merely collided in a hash bucket. A metric saturated at 1.000 for both arms cannot fail, and asserting on it would be a green light wired to nothing.
 
 ### Context building
 

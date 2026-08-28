@@ -142,7 +142,16 @@ func TestBuildContextDoesNotCarryEmbeddings(t *testing.T) {
 		}
 	}
 
-	// Search is the path that does rank on it, and it must still have one.
+	// Search selects the whole row and so still returns the stored embedding,
+	// which is the difference from BuildContext this test exists to pin.
+	//
+	// ⚠️ It no longer returns it because anything RANKS on it. Search moved to
+	// BM25 over an FTS5 index (noteboard todo
+	// 0c31b497-0418-4577-b156-6699918ef5a8), so the embedding column is now
+	// written by Save and read by nothing. That makes this half of the test a
+	// statement about the response shape, not about scoring, and the column is
+	// a deletion nobody has scoped yet — it is in the Memory struct that
+	// agent-store and inber also carry, so removing it is a three-repo change.
 	got, err := s.Search("authentication", 3)
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +161,7 @@ func TestBuildContextDoesNotCarryEmbeddings(t *testing.T) {
 	}
 	for _, m := range got {
 		if len(m.Embedding) == 0 {
-			t.Fatalf("%s came back without an embedding; Search ranks by cosine similarity", m.ID)
+			t.Fatalf("%s came back without an embedding; Search returns the whole row, unlike BuildContext", m.ID)
 		}
 	}
 }

@@ -9,13 +9,42 @@ import (
 	"time"
 )
 
+// recencyDecayPerDay is the per-day multiplier applied to a memory's score for
+// each day since it was last read.
+//
+// Decaying the retrieval score by a fixed factor, rather than asking the model
+// to judge freshness, is the approach the retrieval literature validates; see
+// noteboard note 72503642-f787-4f97-ab4b-576037346bb2. It is unchanged from
+// when relevance came from cosine similarity — the blend was never the defect.
+const recencyDecayPerDay = 0.99
+
+// zeroInformationRelevance is the relevance every candidate is given when BM25
+// separates none of them.
+//
+// bm25() returns 0 for a term that appears in every indexed document, because
+// such a term tells you nothing about which document you want. If the query
+// consists only of such terms, every candidate scores 0, the product with
+// importance and recency is 0 for all of them, and the ranking collapses onto
+// the id tie-break — importance and recency lose their vote for no reason.
+//
+// This is applied only when the WHOLE candidate set is tied at zero, so it can
+// never reorder a set that BM25 did separate.
+const zeroInformationRelevance = 1.0
+
 // SearchFiltered finds memories matching the query, optionally filtered by orchestrator.
 // If orchestrator is empty, all memories are searched.
 func (s *Store) SearchFiltered(query string, limit int, orchestrator string) ([]Memory, error) {
 	return s.searchInternal(query, limit, orchestrator)
 }
 
-// Search finds memories matching the query, ranked by similarity, recency, and importance.
+// Search finds memories matching the query, ranked by relevance, importance and
+// recency.
+//
+// Relevance is BM25 over an FTS5 index of the content and summary. It used to be
+// the cosine similarity of a 256-bucket hashed bag of words, which had no term
+// weighting of any kind: every word counted the same whether it appeared in one
+// memory or all of them, and unrelated words sharing a bucket scored as a match.
+// See noteboard todo 0c31b497-0418-4577-b156-6699918ef5a8.
 func (s *Store) Search(query string, limit int) ([]Memory, error) {
 	return s.searchInternal(query, limit, "")
 }
@@ -25,20 +54,30 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 		limit = 10
 	}
 
-	// Generate query embedding
-	queryEmb := s.embedder.Embed(query)
+	// A query with no searchable terms matches nothing, and says so. The cosine
+	// path could not: an all-zero query vector scored 0 against every memory,
+	// which sorted the whole store by id and returned the first `limit` of it as
+	// though they were results.
+	match, ok := ftsMatchExpression(query)
+	if !ok {
+		return []Memory{}, nil
+	}
 
-	// Fetch all non-forgotten, non-expired memories
 	now := time.Now()
 	sqlQuery := `
-	SELECT id, content, summary, original_id, importance, access_count, last_accessed, created_at, source, embedding, always_load, expires_at, tokens, ref_type, ref_target, is_lazy, orchestrator
-	FROM memories
-	WHERE importance > 0
-	  AND (expires_at IS NULL OR expires_at > ?)
+	SELECT m.id, m.content, m.summary, m.original_id, m.importance, m.access_count,
+	       m.last_accessed, m.created_at, m.source, m.embedding, m.always_load,
+	       m.expires_at, m.tokens, m.ref_type, m.ref_target, m.is_lazy, m.orchestrator,
+	       bm25(` + ftsTableName + `), ` + ftsTableName + `.memory_id
+	FROM ` + ftsTableName + `
+	JOIN memories m ON m.rowid = ` + ftsTableName + `.rowid
+	WHERE ` + ftsTableName + ` MATCH ?
+	  AND m.importance > 0
+	  AND (m.expires_at IS NULL OR m.expires_at > ?)
 	`
-	args := []interface{}{now.Unix()}
+	args := []interface{}{match, now.Unix()}
 	if orchestrator != "" {
-		sqlQuery += " AND orchestrator = ?"
+		sqlQuery += " AND m.orchestrator = ?"
 		args = append(args, orchestrator)
 	}
 	rows, err := s.db.Query(sqlQuery, args...)
@@ -48,11 +87,13 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 	defer rows.Close()
 
 	type scored struct {
-		memory Memory
-		score  float64
+		memory    Memory
+		relevance float64
+		score     float64
 	}
 	var candidates []scored
 	memoryIDs := []string{}
+	var maxRelevance float64
 
 	for rows.Next() {
 		var m Memory
@@ -60,15 +101,24 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 		var embJSON []byte
 		var lastAccessed, createdAt int64
 		var expiresAt sql.NullInt64
+		var bm25Score float64
+		var indexedMemoryID string
 
 		err := rows.Scan(
 			&m.ID, &m.Content, &summary, &originalID,
 			&m.Importance, &m.AccessCount, &lastAccessed, &createdAt, &m.Source, &embJSON,
 			&m.AlwaysLoad, &expiresAt, &m.Tokens,
 			&m.RefType, &refTarget, &m.IsLazy, &m.Orchestrator,
+			&bm25Score, &indexedMemoryID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan memory: %w", err)
+		}
+
+		// The index is keyed on memories.rowid, which a VACUUM of that table is
+		// free to renumber. Refuse rather than answer with the wrong memory.
+		if indexedMemoryID != m.ID {
+			return nil, ftsRowidDriftError(indexedMemoryID, m.ID)
 		}
 
 		m.Summary = summary.String
@@ -81,26 +131,39 @@ func (s *Store) searchInternal(query string, limit int, orchestrator string) ([]
 			m.ExpiresAt = &exp
 		}
 
+		// The embedding column is still written and still returned, so a caller
+		// reading it sees no change. Nothing ranks on it any more.
 		if err := json.Unmarshal(embJSON, &m.Embedding); err != nil {
 			return nil, fmt.Errorf("unmarshal embedding: %w", err)
 		}
 
-		// Calculate similarity
-		similarity := CosineSimilarity(queryEmb, m.Embedding)
+		// bm25() is negative and orders ascending — a more relevant document is
+		// a more negative number — so the sign flip is what turns it into a
+		// score that composes with importance and recency.
+		relevance := -bm25Score
+		if relevance < 0 {
+			relevance = 0
+		}
+		if relevance > maxRelevance {
+			maxRelevance = relevance
+		}
 
-		// Calculate recency boost (decays over time)
-		daysSinceAccess := now.Sub(m.LastAccessed).Hours() / 24
-		recencyBoost := math.Pow(0.99, daysSinceAccess)
-
-		// Combined score
-		score := similarity * m.Importance * recencyBoost
-
-		candidates = append(candidates, scored{memory: m, score: score})
+		candidates = append(candidates, scored{memory: m, relevance: relevance})
 		memoryIDs = append(memoryIDs, m.ID)
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate rows: %w", err)
+	}
+
+	for i := range candidates {
+		relevance := candidates[i].relevance
+		if maxRelevance == 0 {
+			relevance = zeroInformationRelevance
+		}
+		daysSinceAccess := now.Sub(candidates[i].memory.LastAccessed).Hours() / 24
+		recencyBoost := math.Pow(recencyDecayPerDay, daysSinceAccess)
+		candidates[i].score = relevance * candidates[i].memory.Importance * recencyBoost
 	}
 
 	// Fetch tags for all candidates.

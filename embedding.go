@@ -6,8 +6,24 @@ import (
 	"unicode"
 )
 
-// Embedder generates simple TF-IDF style embeddings for text.
-// This is a placeholder until we integrate a proper embedding model.
+// Embedder generates a fixed-size hashed bag-of-words vector for text.
+//
+// ⚠️ Nothing ranks on it. Search moved to BM25 over an FTS5 index of the same
+// text (noteboard todo 0c31b497-0418-4577-b156-6699918ef5a8); Save still calls
+// Embed and still stores the result in the `embedding` column, and no read path
+// scores on it any more.
+//
+// Its doc comment used to say "simple TF-IDF style embeddings ... a placeholder
+// until we integrate a proper embedding model", and both halves were wrong in
+// the same direction. There is no IDF anywhere in it — every term counts the
+// same whether it appears in one memory or in all of them, which is the whole
+// of what IDF is for — and it was not on the way to an embedding model. It
+// hashes tokens into 256 buckets, so unrelated words share a bucket and score
+// as a match; the measurement is in TestBM25OutranksTheHashedBagOfWords.
+//
+// It is kept, rather than deleted, because Memory.Embedding is part of the
+// struct agent-store and inber also carry. Retiring the column is a three-repo
+// change and has its own card.
 type Embedder struct {
 	// Document frequency map (built incrementally)
 	// In production, this would be pre-computed or use an external model

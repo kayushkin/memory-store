@@ -166,10 +166,26 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("create sessions schema: %w", err)
 	}
 
+	// The full-text index Search ranks on. It is created here rather than in
+	// runMigrations because it is part of the schema a new store needs, not a
+	// repair to an old one; the backfill below is the repair half.
+	if _, err := db.Exec(ftsSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create fts schema: %w", err)
+	}
+
 	// Run migrations for existing databases
 	if err := runMigrations(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("run migrations: %w", err)
+	}
+
+	// Index whatever the index is missing. A store written before Search moved
+	// off cosine similarity has every memory to index; one written after has
+	// none, and the statement costs a single scan.
+	if err := backfillFullTextIndex(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	return &Store{

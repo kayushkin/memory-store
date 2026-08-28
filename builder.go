@@ -43,8 +43,12 @@ func (s *Store) BuildContext(req BuildContextRequest) ([]Memory, int, error) {
 	// importance, tag overlap and recency — it never calls CosineSimilarity —
 	// so selecting the vector meant reading and JSON-decoding roughly 780 bytes
 	// per row to throw it away, which was the single largest cost in this
-	// function. Search is the path that ranks by embedding, and it still selects
-	// it.
+	// function.
+	//
+	// This used to end "Search is the path that ranks by embedding, and it still
+	// selects it". Search now ranks on BM25 over an FTS5 index and no longer
+	// ranks on the embedding either, though it still selects the column because
+	// it returns the whole row. Nothing on this box ranks by embedding any more.
 	//
 	// There is deliberately no ORDER BY. The ordering contract lives in the
 	// comparator below, which is total, so the result does not depend on the

@@ -4,15 +4,26 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 // storeWithTiedMemories saves n memories that score identically — same
-// importance, same token count, no tags, so no tag bonus and the same recency
-// bucket — under ids that sort ascending. insertOrder decides which id is
+// importance, same token count, no tags, so no tag bonus, and one shared
+// timestamp — under ids that sort ascending. insertOrder decides which id is
 // written first, which is the only thing that differs between the two stores
 // these tests build.
+//
+// The shared timestamp is load-bearing and used not to be. Save defaults an
+// unset LastAccessed to time.Now(), so writing n memories in a loop stamped
+// each one a few microseconds after the last, and Search's recency term —
+// 0.99^daysSinceAccess, a continuous multiplier rather than BuildContext's
+// bucket — turned those microseconds into n distinct scores. The tie held only
+// because the search test queried for words no memory contained, which scored
+// every candidate 0 and multiplied the difference away. A fixture whose tie
+// depends on the query matching nothing cannot survive a ranking change, and
+// did not: it broke the moment relevance stopped being 0 for a non-match.
 func storeWithTiedMemories(t *testing.T, name string, n int, insertOrder []int) *Store {
 	t.Helper()
 
@@ -22,13 +33,16 @@ func storeWithTiedMemories(t *testing.T, name string, n int, insertOrder []int) 
 	}
 	t.Cleanup(func() { s.Close() })
 
+	stamped := time.Now()
 	for _, i := range insertOrder {
 		m := Memory{
-			ID:         fmt.Sprintf("tied-%03d", i),
-			Content:    fmt.Sprintf("tied memory %03d", i),
-			Importance: 0.4,
-			Source:     "test",
-			Tokens:     100,
+			ID:           fmt.Sprintf("tied-%03d", i),
+			Content:      fmt.Sprintf("tied memory %03d", i),
+			Importance:   0.4,
+			Source:       "test",
+			Tokens:       100,
+			CreatedAt:    stamped,
+			LastAccessed: stamped,
 		}
 		if err := s.Save(m); err != nil {
 			t.Fatalf("save %s: %v", m.ID, err)
@@ -149,14 +163,16 @@ func TestSearchIgnoresTheOrderRowsArriveIn(t *testing.T) {
 	forward := storeWithTiedMemories(t, "search-forward", n, ascending(n))
 	backward := storeWithTiedMemories(t, "search-backward", n, descending(n))
 
-	// Every tied memory has identical content-derived embedding weight relative
-	// to a query that matches none of them, so similarity, importance and
-	// recency are equal across the whole set.
-	a, err := forward.Search("wholly unrelated query text", 10)
+	// The query has to MATCH the tie group, or this test asserts nothing: a
+	// query no memory contains now returns an empty result, and an empty result
+	// compares equal to another empty result whatever the ordering does. Both
+	// words appear in all n memories, so BM25 separates none of them and the
+	// tie is decided by importance and recency, which the fixture holds equal.
+	a, err := forward.Search("tied memory", 10)
 	if err != nil {
 		t.Fatalf("Search (forward): %v", err)
 	}
-	b, err := backward.Search("wholly unrelated query text", 10)
+	b, err := backward.Search("tied memory", 10)
 	if err != nil {
 		t.Fatalf("Search (backward): %v", err)
 	}

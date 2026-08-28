@@ -106,6 +106,14 @@ func (s *Store) Save(m Memory) error {
 		return fmt.Errorf("insert memory: %w", err)
 	}
 
+	// Keep the full-text index in step with the row, inside the same
+	// transaction. On the same connection and outside it, a rolled-back Save
+	// would leave the index describing a memory the store does not have, and
+	// Search would rank a candidate whose row the join then drops.
+	if err := indexMemoryText(tx, m.ID, m.Content, m.Summary); err != nil {
+		return err
+	}
+
 	// Replace tags (delete old, insert new)
 	if _, err := tx.Exec("DELETE FROM memory_tags WHERE memory_id = ?", m.ID); err != nil {
 		return fmt.Errorf("delete old tags: %w", err)
