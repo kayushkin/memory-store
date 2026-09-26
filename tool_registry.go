@@ -56,7 +56,7 @@ func (s *Store) LoadToolRegistry(tools []ToolMetadata) error {
 	builder.WriteString("Important guidelines:\n")
 	builder.WriteString("- Use `repo_map()` to understand codebase structure before reading files\n")
 	builder.WriteString("- Use `recent_files()` to see what's been worked on recently\n")
-	builder.WriteString("- Use `read_file()` to get full file contents only when needed\n")
+	builder.WriteString("- Use `read_files()` to get full file contents only when needed\n")
 	builder.WriteString("- Tools generate fresh data on-demand - don't rely on stale context\n")
 
 	// Save as always-load memory

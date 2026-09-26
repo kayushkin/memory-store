@@ -168,3 +168,23 @@ func TestUpdateToolUsageSummary(t *testing.T) {
 		t.Errorf("missing expected tags: %v (got %v)", wantTags, m.Tags)
 	}
 }
+
+// The guidance lines name tools by string literal, so a rename in the tool
+// set does not reach them. inber's file-reading tool is read_files; the
+// guidance said read_file, which names no tool, in an always-load block.
+func TestLoadToolRegistryGuidanceNamesReadFiles(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.LoadToolRegistry([]ToolMetadata{{Name: "read_files", Description: "read files", Category: "filesystem"}}); err != nil {
+		t.Fatalf("LoadToolRegistry returned error: %v", err)
+	}
+	m, err := s.Get("tool-registry")
+	if err != nil {
+		t.Fatalf("Get(tool-registry) failed: %v", err)
+	}
+	if !strings.Contains(m.Content, "- Use `read_files()` to get full file contents only when needed\n") {
+		t.Errorf("guidance does not name read_files:\n%s", m.Content)
+	}
+	if strings.Contains(m.Content, "`read_file()`") {
+		t.Errorf("guidance still names read_file, which is not a tool:\n%s", m.Content)
+	}
+}
